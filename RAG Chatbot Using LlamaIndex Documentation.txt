@@ -1,0 +1,208 @@
+## Basic RAG Format Using LlamaIndex and OpenSource Embedding and LLMs:
+
+--> Prerequisities and Installation:
+
+1. Sentence Transformer (For Embedding)
+2. OpenSource LLMs From HuggingFace(For Referencing)
+3. Database Initialization
+
+## prerequisites for Installation:
+!pip install -q llama-index-readers-file
+!pip install -q llama-index-vector-stores-postgres
+!pip install -q llama-index-embeddings-huggingface
+!pip install -q llama-index-llms-llama-cpp
+!pip install -q llama-cpp-python
+
+!pip install -q llama-index-vector-stores-qdrant
+!pip install -q -U qdrant_client
+
+
+# 1. Setting Up Sentence Transformer For the Embedding
+
+# sentence transformers
+
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-base-en-v1.5")
+
+# 2. Setting Up LLMs
+
+from llama_index.llms.llama_cpp import LlamaCPP
+
+# model_url = "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGML/resolve/main/llama-2-13b-chat.ggmlv3.q4_0.bin"
+model_url = "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_0.gguf"
+
+llm = LlamaCPP(
+    # You can pass in the URL to a GGML model to download it automatically
+    model_url=model_url,
+    # optionally, you can set the path to a pre-downloaded model instead of model_url
+    model_path=None,
+    temperature=0.1,
+    max_new_tokens=256,
+    # llama2 has a context window of 4096 tokens, but we set it lower to allow for some wiggle room
+    context_window=3900,
+    # kwargs to pass to __call__()
+    generate_kwargs={},
+    # kwargs to pass to __init__()
+    # set to at least 1 to use GPU
+    model_kwargs={"n_gpu_layers": 1},
+    verbose=True,
+)
+
+# 3. Setting Up the Database
+
+## a. Qdrant CloudDatabase
+
+import qdrant_client
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+
+client = qdrant_client.QdrantClient(
+    "https://e13d541b-c980-4ab5-8740-e1722c7fce62.us-east4-0.gcp.cloud.qdrant.io:6333", #<URL>
+    api_key="szG_1FyObD9pvAlC8zFK-M-Wg0vjZEl1hIl3rCp7KGPd9eaSDmh5SQ", # For Qdrant Cloud, None for local instance
+)
+
+vector_store = QdrantVectorStore(client=client, collection_name="RAG-Cluster")
+
+## b. Similarly Postgres Database or any Database can Be Set
+
+
+
+--> Now, the Actually Starts:
+
+Steps:
+1. Loading Data (Data Ingestion)
+2. Indexing the Data Using OpenSource Embedding
+3. Storing the Indexed Data in the VectorDatabase (Database)
+4. Querying
+
+--> Now, Actually Detailed Coding Starts Here:
+
+1. Loading Data
+
+a. Loading the Data:
+
+from pathlib import Path
+from llama_index.readers.file import PyMuPDFReader
+
+loader = PyMuPDFReader()
+documents = loader.load(file_path="./data/llama2.pdf") 
+
+b. Also Can Load Data Using the Various DataSource
+
+
+
+2. Indexing Using the Open Source Embedding
+
+a. Chunking the Data into appropritate Chunksize with appropriate (Has to be explored Later)
+
+from llama_index.core.node_parser import SentenceSplitter
+
+text_parser = SentenceSplitter(
+    chunk_size=1024,
+    # separator=" ",
+)
+
+text_chunks = []
+# maintain relationship with source doc index, to help inject doc metadata in (3)
+doc_idxs = []
+for doc_idx, doc in enumerate(documents):
+    cur_text_chunks = text_parser.split_text(doc.text)
+    text_chunks.extend(cur_text_chunks)
+    doc_idxs.extend([doc_idx] * len(cur_text_chunks))
+
+## constructing Nodes from text Chunks
+from llama_index.core.schema import TextNode
+
+nodes = []
+for idx, text_chunk in enumerate(text_chunks):
+    node = TextNode(
+        text=text_chunk,
+    )
+    src_doc = documents[doc_idxs[idx]]
+    node.metadata = src_doc.metadata
+    nodes.append(node)
+
+## Indexing
+
+for node in nodes:
+    node_embedding = embed_model.get_text_embedding(
+        node.get_content(metadata_mode="all")
+    )
+    node.embedding = node_embedding
+
+3. Storing Indexing in the Database
+
+from llama_index.core import VectorStoreIndex
+from llama_index.core import StorageContext
+
+client = qdrant_client.QdrantClient(
+    "https://e13d541b-c980-4ab5-8740-e1722c7fce62.us-east4-0.gcp.cloud.qdrant.io:6333",
+    api_key="szG_1FyObD9pvAlC8zFK-M-Wg0vjZEl1hIl3rCp7KGPd9eaSDmh5SQ", # For Qdrant Cloud, None for local instance
+)
+
+vector_store = QdrantVectorStore(client=client, collection_name="RAG-Cluster")
+
+vector_store.add(nodes)
+
+4. Retriever
+
+from llama_index.core import QueryBundle
+from llama_index.core.retrievers import BaseRetriever
+from typing import Any, List
+
+
+class VectorDBRetriever(BaseRetriever):
+    """Retriever over a Qdrant vector store."""
+
+    def __init__(
+        self,
+        vector_store: QdrantVectorStore,
+        embed_model: Any,
+        query_mode: str = "default",
+        similarity_top_k: int = 2,
+    ) -> None:
+        """Init params."""
+        self._vector_store = vector_store
+        self._embed_model = embed_model
+        self._query_mode = query_mode
+        self._similarity_top_k = similarity_top_k
+        super().__init__()
+
+    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        """Retrieve."""
+        query_embedding = embed_model.get_query_embedding(
+            query_bundle.query_str
+        )
+        vector_store_query = VectorStoreQuery(
+            query_embedding=query_embedding,
+            similarity_top_k=self._similarity_top_k,
+            mode=self._query_mode,
+        )
+        query_result = vector_store.query(vector_store_query)
+
+        nodes_with_scores = []
+        for index, node in enumerate(query_result.nodes):
+            score: Optional[float] = None
+            if query_result.similarities is not None:
+                score = query_result.similarities[index]
+            nodes_with_scores.append(NodeWithScore(node=node, score=score))
+
+        return nodes_with_scores
+
+
+retriever = VectorDBRetriever(
+    vector_store, embed_model, query_mode="default", similarity_top_k=2
+)
+
+## Querying and Getting Data
+
+from llama_index.core.query_engine import RetrieverQueryEngine
+
+query_engine = RetrieverQueryEngine.from_args(retriever, llm=llm)
+
+query_str = "How does Llama 2 perform compared to other open-source models?"
+
+response = query_engine.query(query_str)
+
+
+
+
